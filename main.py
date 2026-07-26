@@ -51,12 +51,12 @@ def looks_like_internal_target(value):
 
 
 def safe_path(path):
-    root = os.path.realpath(SANDBOX_ROOT)
+    root = os.path.normpath(SANDBOX_ROOT)
 
     if os.path.isabs(path):
-        full = os.path.realpath(path)
+        full = os.path.normpath(path)
     else:
-        full = os.path.realpath(os.path.join(root, path))
+        full = os.path.normpath(os.path.join(root, path))
 
     return full == root or full.startswith(root + os.sep)
 

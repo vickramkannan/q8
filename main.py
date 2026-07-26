@@ -21,7 +21,7 @@ class ToolRequest(BaseModel):
 
 
 def is_internal_host(host):
-    host = host.lower()
+    host = host.lower().strip()
 
     if host == "localhost":
         return True
@@ -34,20 +34,28 @@ def is_internal_host(host):
             or ip.is_loopback
             or ip.is_link_local
             or ip.is_reserved
+            or ip.is_multicast
         )
 
     except ValueError:
+        # Normal domain names are not treated as IPs
         return False
 
 
 def looks_like_internal_target(value):
-    value = unquote(value)
+    value = unquote(value).strip()
 
-    if "://" in value:
+    # Only inspect actual URLs
+    if "://" not in value:
+        return False
+
+    try:
         u = urlparse(value)
-        return is_internal_host(u.hostname or "")
+        host = u.hostname or ""
+        return is_internal_host(host)
 
-    return is_internal_host(value)
+    except Exception:
+        return False
 
 
 def safe_path(path):
@@ -56,32 +64,83 @@ def safe_path(path):
     if os.path.isabs(path):
         full = os.path.normpath(path)
     else:
-        full = os.path.normpath(os.path.join(root, path))
+        full = os.path.normpath(
+            os.path.join(root, path)
+        )
 
-    return full == root or full.startswith(root + os.sep)
+    return (
+        full == root
+        or full.startswith(root + os.sep)
+    )
 
 
 def read_file(path):
-    with open(os.path.join(SANDBOX_ROOT, path), "r") as f:
+
+    if os.path.isabs(path):
+        full = path
+    else:
+        full = os.path.join(
+            SANDBOX_ROOT,
+            path
+        )
+
+    with open(full, "r") as f:
         return f.read()
 
 
 def fetch_url(url):
 
     u = urlparse(url)
+
     host = (u.hostname or "").lower()
 
+    # Block non-approved hosts
     if host not in ALLOWED_HOSTS:
         return None, "host not allowed"
 
+
+    # Check redirect-style parameters
     for values in parse_qs(u.query).values():
-        for v in values:
-            if looks_like_internal_target(v):
-                return None, "redirect target blocked"
 
-    r = requests.get(url, timeout=5)
+        for value in values:
 
-    return r.text, "success"
+            if looks_like_internal_target(value):
+                return None, "internal redirect blocked"
+
+
+    try:
+        response = requests.get(
+            url,
+            timeout=5,
+            allow_redirects=False
+        )
+
+        # Block real redirects to another host
+        if response.is_redirect:
+
+            location = response.headers.get(
+                "location",
+                ""
+            )
+
+            if location:
+
+                redirect_host = (
+                    urlparse(location).hostname
+                    or ""
+                ).lower()
+
+                if redirect_host not in ALLOWED_HOSTS:
+                    return None, "redirect blocked"
+
+
+        return response.text, "success"
+
+
+    except Exception as e:
+
+        return None, str(e)
+
 
 
 @app.post("/check")
@@ -90,50 +149,64 @@ def check(req: ToolRequest):
     tool = req.tool
     args = req.arguments
 
+
+    # FILE TOOL
     if tool == "read_file":
 
-        path = args.get("path")
+        path = args.get("path", "")
+
 
         if not safe_path(path):
+
             return {
                 "action": "block",
                 "reason": "path outside sandbox"
             }
 
+
         try:
-            result = read_file(path)
+
+            content = read_file(path)
 
             return {
                 "action": "allow",
                 "reason": "inside sandbox",
-                "result": result
+                "result": content
             }
 
+
         except Exception as e:
+
             return {
                 "action": "allow",
-                "reason": "file read failed",
+                "reason": "file error",
                 "result": str(e)
             }
 
 
-    elif tool == "fetch_url":
 
-        url = args.get("url")
+    # NETWORK TOOL
+    if tool == "fetch_url":
+
+        url = args.get("url", "")
 
         result, reason = fetch_url(url)
 
+
         if result is None:
+
             return {
                 "action": "block",
                 "reason": reason
             }
+
 
         return {
             "action": "allow",
             "reason": "allowed host",
             "result": result
         }
+
 
 
     return {
